@@ -4,6 +4,12 @@ import cv2
 import numpy as np
 
 TRACKBAR_MAX = 300
+CIRCULARITY_MIN = 0.7
+SOLIDITY_MIN = 0.6
+SWEEP_POINTS = 4
+SWEEP_MIN_RATIO = 0.4
+NESTED_RADIUS_RATIO = 0.75
+NESTED_CENTER_RATIO = 0.25
 
 
 def empty(_):
@@ -31,13 +37,14 @@ def build_trackbars(window, has_alt, escala_inicial):
     cv2.createTrackbar("param1", window, 100, TRACKBAR_MAX, empty)
     cv2.createTrackbar("param2", window, 100, TRACKBAR_MAX, empty)
     cv2.createTrackbar("param2ALT", window, 50, 99, empty)
-    cv2.createTrackbar("minDist", window, 60, TRACKBAR_MAX, empty)
-    cv2.createTrackbar("minRadius", window, 10, TRACKBAR_MAX, empty)
+    cv2.createTrackbar("minDist", window, 20, TRACKBAR_MAX, empty)
+    cv2.createTrackbar("minRadius", window, 1, TRACKBAR_MAX, empty)
     cv2.createTrackbar("maxRadius", window, 0, TRACKBAR_MAX, empty)
     cv2.createTrackbar("dp", window, 12, 30, empty)
     cv2.createTrackbar("blur", window, 5, 30, empty)
     cv2.createTrackbar("median", window, 0, 30, empty)
-    cv2.createTrackbar("metodo", window, 1, 1 if has_alt else 0, empty)
+    cv2.createTrackbar("metodo", window, 1, 2, empty)
+    cv2.createTrackbar("boost", window, 1, 1, empty)
     cv2.createTrackbar("escala", window, escala_inicial, 300, empty)
 
 
@@ -52,6 +59,7 @@ def get_params(window):
     b = cv2.getTrackbarPos("blur", window)
     m = cv2.getTrackbarPos("median", window)
     metodo = cv2.getTrackbarPos("metodo", window)
+    boost = cv2.getTrackbarPos("boost", window)
     if md < 1:
         md = 1
     if dp < 0.1:
@@ -62,7 +70,61 @@ def get_params(window):
         b += 1
     if m > 0 and m % 2 == 0:
         m += 1
-    return p1, p2, p2alt, md, mn, mx, dp, b, m, metodo
+    return p1, p2, p2alt, md, mn, mx, dp, b, m, metodo, boost
+
+
+def _param2_sweep(p2):
+    low = max(0.1, p2 * SWEEP_MIN_RATIO)
+    return [round(p2 - (p2 - low) * i / SWEEP_POINTS, 3) for i in range(SWEEP_POINTS + 1)]
+
+
+def _detect_by_hough(gray, method, dp, min_dist, param1, param2, min_r, max_r):
+    circles = cv2.HoughCircles(
+        gray,
+        method,
+        dp=dp,
+        minDist=min_dist,
+        param1=param1,
+        param2=param2,
+        minRadius=min_r,
+        maxRadius=max_r,
+    )
+    if circles is None:
+        return []
+    return circles[0].tolist()
+
+
+def _hough_multi_pass(gray, method, dp, md, p1, p2, mn, mx):
+    found = []
+    for acc in _param2_sweep(p2):
+        found.extend(_detect_by_hough(gray, method, dp, md, p1, acc, mn, mx))
+    md2 = max(1, md // 2)
+    if md2 != md:
+        for acc in _param2_sweep(p2):
+            found.extend(_detect_by_hough(gray, method, dp, md2, p1, acc, mn, mx))
+    return found
+
+
+def _detect_by_contours(gray, min_r, max_r):
+    results = []
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for bin_img in (th, cv2.bitwise_not(th)):
+        contours, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            area = cv2.contourArea(c)
+            perim = cv2.arcLength(c, True)
+            if perim <= 0:
+                continue
+            circularity = 4.0 * math.pi * area / (perim * perim)
+            if circularity < CIRCULARITY_MIN:
+                continue
+            (x, y), r = cv2.minEnclosingCircle(c)
+            if r < min_r or r > max_r:
+                continue
+            if math.pi * r * r > 0 and area / (math.pi * r * r) < SOLIDITY_MIN:
+                continue
+            results.append((x, y, r))
+    return results
 
 
 def _intersection_area(x1, y1, r1, x2, y2, r2):
@@ -86,8 +148,13 @@ def dedupe(circles, overlap_ratio=0.5):
         x, y, r = float(x), float(y), float(r)
         duplicate = False
         for kx, ky, kr in kept:
+            d = math.hypot(x - kx, y - ky)
+            big = max(r, kr)
+            small = min(r, kr)
+            if big > 0 and d <= NESTED_CENTER_RATIO * big and small / big < NESTED_RADIUS_RATIO:
+                continue
             inter = _intersection_area(x, y, r, kx, ky, kr)
-            if inter >= overlap_ratio * math.pi * min(r, kr) ** 2:
+            if inter >= overlap_ratio * math.pi * small ** 2:
                 duplicate = True
                 break
         if not duplicate:
@@ -116,8 +183,13 @@ def main():
     auto_max_radius = min(img.shape[0], img.shape[1]) // 2
     last_count = None
     last_win_size = None
+    last_params = None
+    gray_cache = None
+    detected = []
+    modo_texto = ""
 
     print("Ajuste os sliders para calibrar a deteccao.")
+    print("metodo: 0=GRADIENT, 1=ALT, 2=HIBRIDO. boost=multi-passe.")
     print("ESC ou Q para sair. Use + e - para aumentar/diminuir a escala.")
     if not has_alt:
         print("Metodo ALT indisponivel nesta versao do OpenCV.")
@@ -129,56 +201,70 @@ def main():
         if tb_escala >= 10 and tb_escala != escala:
             escala = tb_escala
 
-        p1, p2, p2alt, md, mn, mx, dp, b, m, metodo = get_params(window)
+        params = get_params(window)
+        p1, p2, p2alt, md, mn, mx, dp, b, m, metodo, boost = params
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = clahe.apply(gray)
-        gray = cv2.GaussianBlur(gray, (b, b), 0)
-        if m > 0:
-            gray = cv2.medianBlur(gray, m)
+        if params != last_params or gray_cache is None:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = clahe.apply(gray)
+            gray = cv2.GaussianBlur(gray, (b, b), 0)
+            if m > 0:
+                gray = cv2.medianBlur(gray, m)
+            gray_cache = gray
 
-        use_alt = has_alt and metodo == 1
-        method = cv2.HOUGH_GRADIENT_ALT if use_alt else cv2.HOUGH_GRADIENT
-        if use_alt:
-            dp = 1.0
-            param2 = p2alt
-        else:
-            param2 = p2
+            use_alt = has_alt and metodo == 1
+            method = cv2.HOUGH_GRADIENT_ALT if use_alt else cv2.HOUGH_GRADIENT
+            if use_alt:
+                dp_eff = 1.0
+                param2 = p2alt
+            else:
+                dp_eff = dp
+                param2 = p2
 
-        max_radius = mx if mx > 0 else auto_max_radius
-        circles = cv2.HoughCircles(
-            gray,
-            method,
-            dp=dp,
-            minDist=md,
-            param1=p1,
-            param2=param2,
-            minRadius=mn if mn > 0 else 1,
-            maxRadius=max_radius,
-        )
+            max_radius = mx if mx > 0 else auto_max_radius
+            min_radius = mn if mn > 0 else 1
+
+            candidates = []
+            if metodo == 2:
+                candidates.extend(_detect_by_contours(gray_cache, min_radius, max_radius))
+                candidates.extend(
+                    _detect_by_hough(gray_cache, method, dp_eff, md, p1, param2, min_radius, max_radius)
+                )
+                modo_texto = "HIBRIDO"
+            else:
+                if boost:
+                    candidates.extend(
+                        _hough_multi_pass(gray_cache, method, dp_eff, md, p1, param2, min_radius, max_radius)
+                    )
+                    modo_texto = ("ALT" if use_alt else "GRADIENT") + "+BOOST"
+                else:
+                    candidates.extend(
+                        _detect_by_hough(gray_cache, method, dp_eff, md, p1, param2, min_radius, max_radius)
+                    )
+                    modo_texto = "ALT" if use_alt else "GRADIENT"
+
+            detected = dedupe(candidates)
+            last_params = params
 
         output = img.copy()
-        n = 0
-        if circles is not None:
-            detected = dedupe(circles[0])
-            for x, y, r in detected:
-                cv2.circle(output, (x, y), r, (0, 255, 0), 2)
-                cv2.circle(output, (x, y), 2, (0, 0, 255), 3)
-            n = len(detected)
+        n = len(detected)
         if n != last_count:
             print(f"{n} circulo(s) detectado(s)")
             last_count = n
 
-        modo = "ALT" if use_alt else "GRADIENT"
         cv2.putText(
             output,
-            f"{n} circulos - {modo}",
+            f"{n} circulos - {modo_texto}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             (0, 255, 255),
             2,
         )
+
+        for x, y, r in detected:
+            cv2.circle(output, (x, y), r, (0, 255, 0), 2)
+            cv2.circle(output, (x, y), 2, (0, 0, 255), 3)
 
         s = escala / 100.0
         win_w = max(1, int(round(img.shape[1] * s)))
